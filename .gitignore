@@ -1,0 +1,16 @@
+# Confidential task data - NEVER commit these files
+files/*.csv
+files/*.xlsx
+files/*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+cantill_env/
+
+# Generated outputs (commit only the final required output CSV if the task asks for it)
+outputs/*__run_summary.json
+outputs/*__matching_audit.csv

@@ -1,0 +1,57 @@
+# Company A input mapping, based on the corrected schemas shared on 18 Nov 2026.
+paths:
+  erp: files/erp_goods_receipts.csv
+  invoice_tool: files/invoice_tool_export.csv
+  labels: files/labels_A.csv
+  taxonomy: files/taxonomy_A.csv
+
+reporting_currency: ZAR
+default_vat_rate: 0.15
+
+output: outputs/Deepak_Baghel__A.csv
+
+# Matching is one invoice-tool line to at most one ERP receipt line.
+matching:
+  po_match_threshold: 0.70
+  no_po_match_threshold: 0.86
+  supplier_name_threshold: 0.90
+  max_candidates_per_invoice: 150
+
+supplier_resolution:
+  fuzzy_threshold: 0.92
+
+item_resolution:
+  fuzzy_threshold: 0.93
+  max_token_candidates: 250
+
+classification:
+  # Main build: train on the supplied A gold labels, then train on all labels for inference.
+  use_supervised_labels: true
+  test_size: 0.20
+  random_state: 42
+  # Used only when running the zero-label mode.
+  category_keywords: {}
+  # Optional: set to a locally cached SentenceTransformer model path for semantic zero-shot matching.
+  # Leave blank for the dependency-light TF-IDF fallback.
+  embedding_model: ""
+
+# Conservative starter patterns. Review false positives/negatives after inspecting data.
+non_procurement_patterns:
+  - '\bVAT\b'
+  - '\bVALUE ADDED TAX\b'
+  - '\bSALES TAX\b'
+  - '\bTAXES\b'
+  - '\bINTERCOMPANY\b'
+  - '\bINTER COMPANY\b'
+  - '\bROYALT(?:Y|IES)\b'
+  - '\bPARTNER BILL(?:ING|INGS)\b'
+  - '\bREVENUE\b'
+  - '\bFINANC(?:E|ING) COSTS?\b'
+  - '\bINTEREST CHARGES?\b'
+  - '\bBANK CHARGES?\b'
+  - '\bINCOME TAX\b'
+
+validation:
+  # No task-defined exclusion code exists for a malformed amount, so fail rather than guess.
+  fail_on_invalid_amount: true
+  allow_blank_currency_as_reporting_currency: true
