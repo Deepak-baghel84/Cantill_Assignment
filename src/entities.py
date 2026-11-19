@@ -1,242 +1,155 @@
 from __future__ import annotations
 
-import logging
+from collections import defaultdict
+from difflib import SequenceMatcher
 from typing import Any
 
-import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics import accuracy_score, f1_score
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.model_selection import train_test_split
-from sklearn.pipeline import FeatureUnion
-from sklearn.linear_model import LogisticRegression
 
-from .utils import clean_text
-
-LOGGER = logging.getLogger(__name__)
+from .utils import clean_text, normalize_supplier, stable_key
 
 
-def get_taxonomy_columns(taxonomy: pd.DataFrame) -> list[str]:
-    columns = [c for c in taxonomy.columns if c.lower().startswith("category_l")]
-    return sorted(columns, key=lambda c: int(c.lower().replace("category_l", "")))
+def labels_by_line(labels: pd.DataFrame | None) -> dict[str, dict[str, str]]:
+    """Return gold labels keyed by the ERP line_id (labels use ERP:<line_id>)."""
+    result: dict[str, dict[str, str]] = {}
+    if labels is None or labels.empty:
+        return result
+    for _, row in labels.iterrows():
+        record_id = str(row.get("record_id", "")).strip()
+        if record_id.startswith("ERP:"):
+            line_id = record_id[4:]
+        else:
+            line_id = record_id
+        if not line_id:
+            continue
+        result[line_id] = {
+            key: str(row.get(key, "")).strip()
+            for key in ("category_l1", "category_l2", "category_l3", "supplier_key", "item_key")
+        }
+    return result
 
 
-def get_taxonomy_paths(taxonomy: pd.DataFrame) -> list[tuple[str, ...]]:
-    cols = get_taxonomy_columns(taxonomy)
-    paths: list[tuple[str, ...]] = []
-    for _, row in taxonomy.iterrows():
-        path = tuple(str(row.get(c, "")).strip() for c in cols)
-        path = tuple(value for value in path if value and value.lower() not in {"nan", "none"})
-        if path and path not in paths:
-            paths.append(path)
-    if not paths:
-        raise ValueError("Taxonomy contains no non-empty category paths.")
-    return paths
+def _similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    return SequenceMatcher(None, left, right).ratio()
 
 
-def compose_erp_text(row: pd.Series) -> str:
-    fields = [
-        row.get("material_short_text", ""), row.get("service_short_text", ""),
-        row.get("material_type", ""), row.get("spend_type", ""),
-        row.get("opex_capex", ""), row.get("site_name", ""),
-    ]
-    return " ".join(str(v) for v in fields if clean_text(v))
+class SupplierResolver:
+    """Resolve supplier names to supplied golden keys or deterministic fallback keys."""
+
+    def __init__(self, erp: pd.DataFrame, labels_map: dict[str, dict[str, str]], fuzzy_threshold: float = 0.92):
+        self.fuzzy_threshold = float(fuzzy_threshold)
+        self.row_keys: list[str] = []
+        self.name_to_keys: dict[str, set[str]] = defaultdict(set)
+        self.canonical_names: list[str] = []
+        self.canonical_keys: list[str] = []
+        seen: dict[str, str] = {}
+
+        for _, row in erp.iterrows():
+            line_id = str(row.get("line_id", "")).strip()
+            name = normalize_supplier(row.get("supplier_name", ""))
+            key = labels_map.get(line_id, {}).get("supplier_key", "").strip()
+            if not key:
+                key = stable_key("SG", name or row.get("vendor_id", "UNKNOWN"))
+            self.row_keys.append(key)
+            if name:
+                self.name_to_keys[name].add(key)
+                if name not in seen:
+                    seen[name] = key
+
+        self.canonical_names = list(seen.keys())
+        self.canonical_keys = [seen[name] for name in self.canonical_names]
+
+    def key_for_erp_index(self, index: int) -> str:
+        return self.row_keys[index]
+
+    def resolve_invoice(self, supplier_name: Any) -> str:
+        normalized = normalize_supplier(supplier_name)
+        if not normalized:
+            return stable_key("SG", "UNKNOWN SUPPLIER")
+        exact = self.name_to_keys.get(normalized)
+        if exact:
+            return sorted(exact)[0]
+
+        best_score = 0.0
+        best_key = ""
+        # Supplier cardinality is normally far smaller than invoice-line cardinality.
+        for candidate, key in zip(self.canonical_names, self.canonical_keys):
+            score = _similarity(normalized, candidate)
+            if score > best_score:
+                best_score, best_key = score, key
+        if best_score >= self.fuzzy_threshold and best_key:
+            return best_key
+        return stable_key("SG", normalized)
 
 
-def compose_invoice_text(row: pd.Series) -> str:
-    fields = [row.get("line_text", ""), row.get("supplier_name_as_captured", "")]
-    return " ".join(str(v) for v in fields if clean_text(v))
-
-
-class ZeroShotTaxonomyClassifier:
-    """Taxonomy-only classifier using optional sentence embeddings or offline TF-IDF."""
+class ItemResolver:
+    """Resolve material/service descriptions using golden keys and token blocking."""
 
     def __init__(
         self,
-        taxonomy: pd.DataFrame,
-        category_keywords: dict[str, list[str]] | None = None,
-        embedding_model: str | None = None,
+        erp: pd.DataFrame,
+        labels_map: dict[str, dict[str, str]],
+        fuzzy_threshold: float = 0.93,
+        max_token_candidates: int = 250,
     ):
-        self.paths = get_taxonomy_paths(taxonomy)
-        category_keywords = category_keywords or {}
-        self.documents = []
-        for path in self.paths:
-            synonyms = category_keywords.get(path[-1], [])
-            self.documents.append(clean_text(" ".join((*path, *synonyms))))
+        self.fuzzy_threshold = float(fuzzy_threshold)
+        self.max_token_candidates = max(10, int(max_token_candidates))
+        self.row_keys: list[str] = []
+        self.signatures: list[str] = []
+        self.token_index: dict[str, set[int]] = defaultdict(set)
+        exact_keys: dict[str, set[str]] = defaultdict(set)
 
-        self.embedding_backend = None
-        self.embedding_model = None
-        self.taxonomy_embeddings = None
-        if embedding_model:
-            try:
-                from sentence_transformers import SentenceTransformer
-                self.embedding_model = SentenceTransformer(embedding_model)
-                self.taxonomy_embeddings = self.embedding_model.encode(
-                    self.documents, normalize_embeddings=True, show_progress_bar=False
-                )
-                self.embedding_backend = "sentence_transformers"
-                LOGGER.info("Using sentence-transformer taxonomy classifier: %s", embedding_model)
-            except Exception as exc:
-                LOGGER.warning("Could not load embedding model '%s' (%s); falling back to TF-IDF.", embedding_model, exc)
+        for index, (_, row) in enumerate(erp.iterrows()):
+            line_id = str(row.get("line_id", "")).strip()
+            material_number = clean_text(row.get("material_number", ""))
+            description = clean_text(" ".join([
+                str(row.get("material_short_text", "")),
+                str(row.get("service_short_text", "")),
+                str(row.get("material_type", "")),
+            ]))
+            signature = material_number or description
+            key = labels_map.get(line_id, {}).get("item_key", "").strip()
+            if not key:
+                key = stable_key("IG", signature or f"ROW {index}")
+            self.row_keys.append(key)
+            self.signatures.append(signature)
+            if signature:
+                exact_keys[signature].add(key)
+                for token in set(signature.split()):
+                    if len(token) >= 2:
+                        self.token_index[token].add(index)
 
-        if self.embedding_backend is None:
-            self.embedding_backend = "tfidf"
+        self.exact_keys = dict(exact_keys)
 
-        self.char_vectorizer = TfidfVectorizer(
-            analyzer="char_wb", ngram_range=(2, 5), min_df=1,
-            sublinear_tf=True, max_features=120_000,
-        )
-        self.word_vectorizer = TfidfVectorizer(
-            analyzer="word", ngram_range=(1, 2), min_df=1,
-            sublinear_tf=True, max_features=80_000, token_pattern=r"(?u)\b\w+\b",
-        )
-        self.char_taxonomy = self.char_vectorizer.fit_transform(self.documents)
-        self.word_taxonomy = self.word_vectorizer.fit_transform(self.documents)
+    def key_for_erp_index(self, index: int) -> str:
+        return self.row_keys[index]
 
-    def predict(self, texts: list[str], batch_size: int = 1000) -> list[tuple[tuple[str, ...], float]]:
-        results: list[tuple[tuple[str, ...], float]] = []
-        for start in range(0, len(texts), batch_size):
-            batch = [clean_text(t) for t in texts[start:start + batch_size]]
-            if self.embedding_backend == "sentence_transformers" and self.embedding_model is not None:
-                query_embeddings = self.embedding_model.encode(
-                    batch, normalize_embeddings=True, show_progress_bar=False,
-                    batch_size=min(batch_size, 64),
-                )
-                scores = np.asarray(query_embeddings) @ np.asarray(self.taxonomy_embeddings).T
-                for idx, text in enumerate(batch):
-                    if not text:
-                        results.append((self.paths[0], 0.0))
-                    else:
-                        best = int(np.argmax(scores[idx]))
-                        results.append((self.paths[best], float(np.clip(scores[idx, best], 0.0, 1.0))))
-                continue
-            char = self.char_vectorizer.transform(batch)
-            word = self.word_vectorizer.transform(batch)
-            scores = 0.60 * cosine_similarity(char, self.char_taxonomy) + 0.40 * cosine_similarity(word, self.word_taxonomy)
-            for idx, text in enumerate(batch):
-                if not text or scores.shape[1] == 0:
-                    results.append((self.paths[0], 0.0))
-                else:
-                    best = int(np.argmax(scores[idx]))
-                    results.append((self.paths[best], float(np.clip(scores[idx, best], 0.0, 1.0))))
-        return results
+    def resolve_invoice(self, description: Any) -> str:
+        normalized = clean_text(description)
+        if not normalized:
+            return stable_key("IG", "UNKNOWN ITEM")
+        exact = self.exact_keys.get(normalized)
+        if exact:
+            return sorted(exact)[0]
 
+        tokens = [token for token in set(normalized.split()) if len(token) >= 2]
+        counts: dict[int, int] = defaultdict(int)
+        for token in tokens:
+            for index in self.token_index.get(token, ()):
+                counts[index] += 1
+        candidates = sorted(counts, key=lambda idx: (-counts[idx], idx))[: self.max_token_candidates]
 
-class SupervisedTaxonomyClassifier:
-    """Supervised text classifier trained only on the supplied gold-labelled ERP rows."""
-
-    def __init__(self, taxonomy: pd.DataFrame, random_state: int = 42):
-        self.paths = get_taxonomy_paths(taxonomy)
-        self.path_to_class = {path: i for i, path in enumerate(self.paths)}
-        self.class_to_path = {i: path for path, i in self.path_to_class.items()}
-        self.vectorizer = FeatureUnion([
-            ("word", TfidfVectorizer(
-                analyzer="word", ngram_range=(1, 2), min_df=2,
-                max_features=120_000, sublinear_tf=True,
-                token_pattern=r"(?u)\b\w+\b", strip_accents="unicode",
-            )),
-            ("char", TfidfVectorizer(
-                analyzer="char_wb", ngram_range=(2, 5), min_df=2,
-                max_features=140_000, sublinear_tf=True, strip_accents="unicode",
-            )),
-        ])
-        self.model = LogisticRegression(
-            max_iter=250, C=4.0, class_weight="balanced",
-            solver="lbfgs", random_state=random_state,
-        )
-        self.is_fitted = False
-
-    def fit(self, texts: list[str], paths: list[tuple[str, ...]]) -> "SupervisedTaxonomyClassifier":
-        valid_indices = [i for i, path in enumerate(paths) if path in self.path_to_class and clean_text(texts[i])]
-        if len(valid_indices) < 10:
-            raise ValueError(f"Only {len(valid_indices)} usable labelled rows; need at least 10 to train.")
-        x = [texts[i] for i in valid_indices]
-        y = [self.path_to_class[paths[i]] for i in valid_indices]
-        x_matrix = self.vectorizer.fit_transform(x)
-        self.model.fit(x_matrix, y)
-        self.is_fitted = True
-        return self
-
-    def predict(self, texts: list[str], batch_size: int = 2000) -> list[tuple[tuple[str, ...], float]]:
-        if not self.is_fitted:
-            raise RuntimeError("The supervised classifier has not been fitted.")
-        results = []
-        for start in range(0, len(texts), batch_size):
-            matrix = self.vectorizer.transform(texts[start:start + batch_size])
-            probabilities = self.model.predict_proba(matrix)
-            class_ids = self.model.classes_
-            for row in probabilities:
-                local = int(np.argmax(row))
-                class_id = int(class_ids[local])
-                results.append((self.class_to_path[class_id], float(row[local])))
-        return results
-
-
-def evaluate_supervised_holdout(
-    taxonomy: pd.DataFrame,
-    texts: list[str],
-    target_paths: list[tuple[str, ...]],
-    test_size: float = 0.20,
-    random_state: int = 42,
-) -> dict[str, Any]:
-    valid = [i for i, p in enumerate(target_paths) if p in get_taxonomy_paths(taxonomy) and clean_text(texts[i])]
-    y = [" > ".join(target_paths[i]) for i in valid]
-    if len(valid) < 20:
-        return {"status": "skipped", "reason": "Fewer than 20 usable labelled rows."}
-    counts = pd.Series(y).value_counts()
-    stratify = y if counts.min() >= 2 else None
-    train_idx, test_idx = train_test_split(
-        valid, test_size=test_size, random_state=random_state,
-        stratify=stratify,
-    )
-    model = SupervisedTaxonomyClassifier(taxonomy, random_state=random_state)
-    model.fit([texts[i] for i in train_idx], [target_paths[i] for i in train_idx])
-    predictions = model.predict([texts[i] for i in test_idx])
-    pred = [" > ".join(path) for path, _ in predictions]
-    truth = [" > ".join(target_paths[i]) for i in test_idx]
-    return {
-        "status": "ok",
-        "train_rows": len(train_idx),
-        "test_rows": len(test_idx),
-        "top1_accuracy": round(float(accuracy_score(truth, pred)), 4),
-        "macro_f1": round(float(f1_score(truth, pred, average="macro", zero_division=0)), 4),
-        "weighted_f1": round(float(f1_score(truth, pred, average="weighted", zero_division=0)), 4),
-        "note": "Held-out split; paths are compared at the complete leaf path level.",
-    }
-
-
-def evaluate_zero_shot(
-    predictions: list[tuple[tuple[str, ...], float]],
-    target_paths: list[tuple[str, ...]],
-) -> dict[str, Any]:
-    valid = [(predictions[i][0], target_paths[i]) for i in range(min(len(predictions), len(target_paths))) if target_paths[i]]
-    if not valid:
-        return {"status": "skipped", "reason": "No aligned labels to evaluate."}
-    full = sum(pred == truth for pred, truth in valid) / len(valid)
-    level_scores: dict[str, float] = {}
-    max_level = max(max(len(p), len(t)) for p, t in valid)
-    for level in range(max_level):
-        comparable = [(p[level], t[level]) for p, t in valid if len(p) > level and len(t) > level]
-        if comparable:
-            level_scores[f"l{level + 1}_accuracy"] = round(
-                sum(p == t for p, t in comparable) / len(comparable), 4
-            )
-    return {
-        "status": "ok",
-        "rows_evaluated": len(valid),
-        "complete_path_accuracy": round(full, 4),
-        **level_scores,
-        "note": "Predictions used taxonomy text only; labels were consulted afterwards for evaluation.",
-    }
-
-
-def path_from_label_row(row: pd.Series, level_columns: list[str]) -> tuple[str, ...]:
-    values = []
-    for col in level_columns:
-        value = str(row.get(col, "")).strip()
-        if value and value.lower() not in {"nan", "none"}:
-            values.append(value)
-        else:
-            break
-    return tuple(values)
+        best_score = 0.0
+        best_key = ""
+        for index in candidates:
+            candidate = self.signatures[index]
+            score = _similarity(normalized, candidate)
+            if score > best_score:
+                best_score, best_key = score, self.row_keys[index]
+        if best_score >= self.fuzzy_threshold and best_key:
+            return best_key
+        return stable_key("IG", normalized)

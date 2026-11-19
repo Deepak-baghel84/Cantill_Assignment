@@ -1,155 +1,147 @@
 from __future__ import annotations
 
-from collections import defaultdict
-from difflib import SequenceMatcher
+import hashlib
+import re
 from typing import Any
 
 import pandas as pd
 
-from .utils import clean_text, normalize_supplier, stable_key
+
+def clean_text(value: Any) -> str:
+    """Normalize a value for matching while retaining useful letters/digits."""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().upper()
+    if text in {"", "NAN", "NONE", "NULL", "NAT"}:
+        return ""
+    text = text.replace("&", " AND ")
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def labels_by_line(labels: pd.DataFrame | None) -> dict[str, dict[str, str]]:
-    """Return gold labels keyed by the ERP line_id (labels use ERP:<line_id>)."""
-    result: dict[str, dict[str, str]] = {}
-    if labels is None or labels.empty:
-        return result
-    for _, row in labels.iterrows():
-        record_id = str(row.get("record_id", "")).strip()
-        if record_id.startswith("ERP:"):
-            line_id = record_id[4:]
+def normalize_supplier(value: Any) -> str:
+    """Normalize supplier names and remove common legal suffixes."""
+    text = clean_text(value)
+    if not text:
+        return ""
+    suffixes = {
+        "PTY", "LTD", "LIMITED", "PROPRIETARY", "INC", "INCORPORATED",
+        "LLC", "PLC", "SA", "CC", "CORP", "CORPORATION", "COMPANY", "CO",
+    }
+    tokens = [token for token in text.split() if token not in suffixes]
+    return " ".join(tokens)
+
+
+def parse_number(value: Any) -> float | None:
+    """Parse common finance number formats, returning None for invalid values."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number if pd.notna(number) else None
+
+    text = str(value).strip().replace("\u00a0", "").replace(" ", "")
+    if not text or text.upper() in {"NAN", "NONE", "NULL", "-"}:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+    text = text.replace("'", "")
+
+    # When both separators exist, the last separator is treated as decimal.
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
         else:
-            line_id = record_id
-        if not line_id:
-            continue
-        result[line_id] = {
-            key: str(row.get(key, "")).strip()
-            for key in ("category_l1", "category_l2", "category_l3", "supplier_key", "item_key")
-        }
-    return result
+            text = text.replace(",", "")
+    elif "," in text:
+        tail = text.rsplit(",", 1)[-1]
+        if len(tail) in (1, 2):
+            text = text.replace(",", ".")
+        else:
+            text = text.replace(",", "")
+
+    text = re.sub(r"[^0-9.\-+]", "", text)
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if negative:
+        number = -abs(number)
+    return number if pd.notna(number) else None
 
 
-def _similarity(left: str, right: str) -> float:
-    if not left or not right:
-        return 0.0
-    if left == right:
-        return 1.0
-    return SequenceMatcher(None, left, right).ratio()
+def parse_vat_rate(value: Any, default_rate: float = 0.15) -> float:
+    """Return VAT as a fraction (15% -> 0.15); blank values use the default."""
+    if value is None or str(value).strip() == "":
+        return float(default_rate)
+    text = str(value).strip().replace("%", "")
+    parsed = parse_number(text)
+    if parsed is None:
+        return float(default_rate)
+    rate = float(parsed)
+    if rate > 1:
+        rate /= 100.0
+    if rate < 0 or rate > 1:
+        raise ValueError(f"VAT rate is outside the supported range: {value!r}")
+    return rate
 
 
-class SupplierResolver:
-    """Resolve supplier names to supplied golden keys or deterministic fallback keys."""
-
-    def __init__(self, erp: pd.DataFrame, labels_map: dict[str, dict[str, str]], fuzzy_threshold: float = 0.92):
-        self.fuzzy_threshold = float(fuzzy_threshold)
-        self.row_keys: list[str] = []
-        self.name_to_keys: dict[str, set[str]] = defaultdict(set)
-        self.canonical_names: list[str] = []
-        self.canonical_keys: list[str] = []
-        seen: dict[str, str] = {}
-
-        for _, row in erp.iterrows():
-            line_id = str(row.get("line_id", "")).strip()
-            name = normalize_supplier(row.get("supplier_name", ""))
-            key = labels_map.get(line_id, {}).get("supplier_key", "").strip()
-            if not key:
-                key = stable_key("SG", name or row.get("vendor_id", "UNKNOWN"))
-            self.row_keys.append(key)
-            if name:
-                self.name_to_keys[name].add(key)
-                if name not in seen:
-                    seen[name] = key
-
-        self.canonical_names = list(seen.keys())
-        self.canonical_keys = [seen[name] for name in self.canonical_names]
-
-    def key_for_erp_index(self, index: int) -> str:
-        return self.row_keys[index]
-
-    def resolve_invoice(self, supplier_name: Any) -> str:
-        normalized = normalize_supplier(supplier_name)
-        if not normalized:
-            return stable_key("SG", "UNKNOWN SUPPLIER")
-        exact = self.name_to_keys.get(normalized)
-        if exact:
-            return sorted(exact)[0]
-
-        best_score = 0.0
-        best_key = ""
-        # Supplier cardinality is normally far smaller than invoice-line cardinality.
-        for candidate, key in zip(self.canonical_names, self.canonical_keys):
-            score = _similarity(normalized, candidate)
-            if score > best_score:
-                best_score, best_key = score, key
-        if best_score >= self.fuzzy_threshold and best_key:
-            return best_key
-        return stable_key("SG", normalized)
+def extract_po_and_item(value: Any) -> tuple[str, str]:
+    """Extract an 8–12 digit PO and optional item from free-form PO references."""
+    text = "" if value is None else str(value).strip()
+    if not text or text.upper() in {"NAN", "NONE", "NULL"}:
+        return "", ""
+    # Prefer a long PO-like integer; decimal suffixes on item numbers are accepted.
+    match = re.search(r"(?<!\d)(\d{8,12})(?:\s*/\s*(\d+(?:\.\d+)?))?", text)
+    if not match:
+        digits = re.sub(r"\D", "", text)
+        return (digits, "") if 8 <= len(digits) <= 12 else ("", "")
+    po = match.group(1)
+    item = match.group(2) or ""
+    if item:
+        try:
+            item = str(int(float(item)))
+        except ValueError:
+            item = item.strip()
+    return po, item
 
 
-class ItemResolver:
-    """Resolve material/service descriptions using golden keys and token blocking."""
+def normalize_po(value: Any) -> str:
+    po, _ = extract_po_and_item(value)
+    if po:
+        return po
+    text = str(value or "").strip()
+    return re.sub(r"\.0$", "", text) if text else ""
 
-    def __init__(
-        self,
-        erp: pd.DataFrame,
-        labels_map: dict[str, dict[str, str]],
-        fuzzy_threshold: float = 0.93,
-        max_token_candidates: int = 250,
-    ):
-        self.fuzzy_threshold = float(fuzzy_threshold)
-        self.max_token_candidates = max(10, int(max_token_candidates))
-        self.row_keys: list[str] = []
-        self.signatures: list[str] = []
-        self.token_index: dict[str, set[int]] = defaultdict(set)
-        exact_keys: dict[str, set[str]] = defaultdict(set)
 
-        for index, (_, row) in enumerate(erp.iterrows()):
-            line_id = str(row.get("line_id", "")).strip()
-            material_number = clean_text(row.get("material_number", ""))
-            description = clean_text(" ".join([
-                str(row.get("material_short_text", "")),
-                str(row.get("service_short_text", "")),
-                str(row.get("material_type", "")),
-            ]))
-            signature = material_number or description
-            key = labels_map.get(line_id, {}).get("item_key", "").strip()
-            if not key:
-                key = stable_key("IG", signature or f"ROW {index}")
-            self.row_keys.append(key)
-            self.signatures.append(signature)
-            if signature:
-                exact_keys[signature].add(key)
-                for token in set(signature.split()):
-                    if len(token) >= 2:
-                        self.token_index[token].add(index)
+def stable_key(prefix: str, value: Any) -> str:
+    """Create deterministic opaque IDs; raw supplier/item names are not exposed."""
+    normalized = clean_text(value)
+    if not normalized:
+        normalized = "UNKNOWN"
+    digest = hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}-{digest}"
 
-        self.exact_keys = dict(exact_keys)
 
-    def key_for_erp_index(self, index: int) -> str:
-        return self.row_keys[index]
-
-    def resolve_invoice(self, description: Any) -> str:
-        normalized = clean_text(description)
-        if not normalized:
-            return stable_key("IG", "UNKNOWN ITEM")
-        exact = self.exact_keys.get(normalized)
-        if exact:
-            return sorted(exact)[0]
-
-        tokens = [token for token in set(normalized.split()) if len(token) >= 2]
-        counts: dict[int, int] = defaultdict(int)
-        for token in tokens:
-            for index in self.token_index.get(token, ()):
-                counts[index] += 1
-        candidates = sorted(counts, key=lambda idx: (-counts[idx], idx))[: self.max_token_candidates]
-
-        best_score = 0.0
-        best_key = ""
-        for index in candidates:
-            candidate = self.signatures[index]
-            score = _similarity(normalized, candidate)
-            if score > best_score:
-                best_score, best_key = score, self.row_keys[index]
-        if best_score >= self.fuzzy_threshold and best_key:
-            return best_key
-        return stable_key("IG", normalized)
+def parse_dates(values: pd.Series) -> pd.Series:
+    """Parse mixed ISO and day-month-name dates into pandas datetime values."""
+    series = values.astype("string").fillna("").str.strip()
+    series = series.mask(series.eq(""))
+    try:
+        # pandas >= 2 supports mixed-format parsing.
+        return pd.to_datetime(series, format="mixed", dayfirst=True, errors="coerce")
+    except (TypeError, ValueError):
+        first = pd.to_datetime(series, dayfirst=True, errors="coerce")
+        second = pd.to_datetime(series, dayfirst=False, errors="coerce")
+        return first.fillna(second)
